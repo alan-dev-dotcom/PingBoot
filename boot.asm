@@ -1,144 +1,278 @@
 ; ==============================================================================
-; PingOS Bootloader (PingBoot) - 16-bit / 32-bit Assembly Bootloader
+; PingOS Bootloader - 16-bit / 32-bit Optimized Assembly
 ; ==============================================================================
-[org 0x7c00]          ; BIOS loads the bootloader at physical memory address 0x7C00
+[org 0x7c00]
 
-KERNEL_OFFSET equ 0x1000 ; Memory offset where we will load our kernel
+KERNEL_OFFSET equ 0x1000 ; Segment 0x1000 (0x10000 Physical)
 
 jmp boot_start
 
-; --- Bootloader Data and Strings ---
-MSG_BOOTING db "PingBoot: Loading PingOS Kernel from disk...", 0x0D, 0x0A, 0
-MSG_DISK_ERR db "PingBoot ERROR: Failed to read from disk!", 0x0D, 0x0A, 0
-BOOT_DRIVE db 0
+; --- Optimized Compact Data (Short strings to save space) ---
+MSG_TITLE    db "PingBoot", 0x0D, 0x0A, 0
+opt_0       db "Text Mode", 0
+opt_1      db "Reboot", 0
+MSG_LOAD     db 0x0D, 0x0A, "Booting...", 0x0D, 0x0A, 0
+MSG_ERR      db "Error!", 0x0D, 0x0A, 0
+
+BOOT_DRIVE   db 0
+selected_opt db 0      ; Current choice (0 to 2)
+
+; Array of pointers to menu strings (for compact loop rendering)
+menu_options:
+    dw opt_0
+    dw opt_1
 
 boot_start:
-    mov [BOOT_DRIVE], dl ; BIOS stores the boot drive number in DL on startup
+    mov [BOOT_DRIVE], dl ; Save boot drive
 
-    ; Set up segments to 0
+    ; Initialize segments
     xor ax, ax
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0x9000      ; Set stack pointer safely away from the bootloader
+    mov sp, 0x7C00
 
-    ; Print greeting message
-    mov si, MSG_BOOTING
+menu_loop:
+    call draw_menu
+
+.wait_key:
+    mov ah, 0x00
+    int 0x16            ; Get key press (AH = Scan code, AL = ASCII)
+
+    cmp ah, 0x48        ; Up Arrow
+    je .go_up
+    cmp ah, 0x50        ; Down Arrow
+    je .go_down
+    cmp al, 0x0D        ; Enter
+    je .select
+    jmp .wait_key
+
+.go_up:
+    dec byte [selected_opt]
+    jns menu_loop
+    mov byte [selected_opt], 2 ; Wrap to bottom
+    jmp menu_loop
+
+.go_down:
+    inc byte [selected_opt]
+    cmp byte [selected_opt], 3
+    jl menu_loop
+    mov byte [selected_opt], 0 ; Wrap to top
+    jmp menu_loop
+
+.select:
+    mov al, [selected_opt]
+    cmp al, 2
+    je reboot_system
+    cmp al, 0
+    jne .continue_boot
+    call setup_vbe
+
+.continue_boot:
+    mov si, MSG_LOAD
     call print_string_16
 
-    ; Load kernel from disk
+    call detect_memory
+    call enable_a20
     call load_kernel
-
-    ; Switch to 32-bit Protected Mode
     call switch_to_pm
+    jmp $
 
-    jmp $               ; Hang if we somehow return
+reboot_system:
+    jmp 0xFFFF:0x0000   ; Warm reboot
 
-; --- Helper: Print String in 16-bit Real Mode ---
+; --- Render Interactive Menu (Optimized Loop) ---
+draw_menu:
+    ; Reset screen to standard text mode 3 (clears screen)
+    mov ax, 0x0003
+    int 0x10
+
+    mov si, MSG_TITLE
+    call print_string_16
+    call print_newline
+
+    xor cx, cx          ; CX = Current option index
+
+.loop_opts:
+    ; Print selection indicator
+    mov al, ' '
+    cmp cl, [selected_opt]
+    jne .no_cursor
+    mov al, '>'
+.no_cursor:
+    call print_char
+    mov al, ' '
+    call print_char
+
+    ; Get menu option string address from word array
+    mov bx, cx
+    shl bx, 1           ; Index * 2 (words)
+    mov si, [menu_options + bx]
+    call print_string_16
+    call print_newline
+
+    inc cx
+    cmp cx, 3
+    jl .loop_opts
+    ret
+
+print_char:
+    mov ah, 0x0E
+    int 0x10
+    ret
+
+print_newline:
+    mov al, 0x0D
+    call print_char
+    mov al, 0x0A
+    call print_char
+    ret
+
 print_string_16:
     pusha
 .loop:
-    lodsb               ; Load byte from SI into AL, increment SI
-    or al, al           ; Check if AL is 0 (Null-terminator)
+    lodsb
+    or al, al
     jz .done
-    mov ah, 0x0E        ; BIOS teletype video function
-    int 0x10            ; Call video interrupt
+    call print_char
     jmp .loop
 .done:
     popa
     ret
 
-; --- Helper: Load Kernel from Disk via BIOS ---
-load_kernel:
+; --- Get System Memory Map (E820) ---
+detect_memory:
     pusha
-    mov ax, KERNEL_OFFSET ; ES:BX must point to the destination buffer
-    mov es, ax
-    xor bx, bx          ; Destination buffer = 0x1000:0000 (Physical 0x10000)
+    mov di, 0x9004
+    xor ebx, ebx
+    xor bp, bp          ; Entry count
+    mov edx, 0x534D4150
 
-    mov ah, 0x02        ; BIOS read sector function
-    mov al, 64          ; Read 64 sectors (32KB of kernel code - safe for larger builds)
-    mov ch, 0x00        ; Cylinder 0
-    mov dh, 0x00        ; Head 0
-    mov cl, 0x02        ; Start reading from Sector 2 (Sector 1 is our Bootloader)
-    mov dl, [BOOT_DRIVE] ; Load drive number
-    int 0x13            ; BIOS Disk Interrupt
+.loop:
+    mov eax, 0xE820
+    mov ecx, 24
+    int 0x15
+    jc .done
+    cmp eax, 0x534D4150
+    jne .done
+    add di, 24
+    inc bp
+    test ebx, ebx
+    jne .loop
 
-    jc disk_error       ; Jump if Carry Flag is set (indicates disk error)
+.done:
+    mov [0x9000], bp    ; Save count at 0x9000
     popa
     ret
 
-disk_error:
-    mov si, MSG_DISK_ERR
+; --- Enable A20 ---
+enable_a20:
+    pusha
+    mov ax, 0x2401
+    int 0x15            ; BIOS enable
+    in al, 0x92
+    or al, 2
+    out 0x92, al        ; Fast A20
+    popa
+    ret
+
+; --- Setup VBE Graphics Mode ---
+setup_vbe:
+    pusha
+    mov ax, 0x4F01
+    mov cx, 0x4115      ; VBE Mode 800x600x32bpp with LFB
+    mov di, 0x8000      ; Info block destination
+    int 0x10
+    cmp ax, 0x004F
+    jne .err
+
+    mov ax, 0x4F02
+    mov bx, 0x4115
+    int 0x10
+    cmp ax, 0x004F
+    je .done
+
+.err:
+    mov si, MSG_ERR
     call print_string_16
-    jmp $               ; Hang on error
+.done:
+    popa
+    ret
+
+; --- Load Kernel with Retries ---
+load_kernel:
+    pusha
+    mov cl, 3           ; Retries
+.retry:
+    push cx
+    mov ax, KERNEL_OFFSET
+    mov es, ax
+    xor bx, bx          ; ES:BX = 0x1000:0000
+
+    mov ax, 0x0240      ; AH = 02 (Read), AL = 64 (Sectors)
+    mov cx, 0x0002      ; CH = 0 (Cylinder), CL = 2 (Sector)
+    mov dh, 0x00        ; DH = 0 (Head)
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    jnc .success
+
+    ; Reset disk
+    xor ax, ax
+    int 0x13
+    pop cx
+    dec cl
+    jnz .retry
+
+    mov si, MSG_ERR
+    call print_string_16
+    jmp $               ; Hang on failure
+
+.success:
+    pop cx
+    popa
+    ret
 
 ; ==============================================================================
-; 32-bit Protected Mode Initialization
+; Protected Mode Setup
 ; ==============================================================================
 
-; Global Descriptor Table (GDT) defining flat memory space
 gdt_start:
-    ; Null descriptor (required)
-    dd 0x0
-    dd 0x0
-
+    dd 0, 0             ; Null Descriptor
 gdt_code:
-    ; Code Segment Descriptor
-    dw 0xffff           ; Limit (0-15)
-    dw 0x0              ; Base (0-15)
-    db 0x0              ; Base (16-23)
-    db 10011010b        ; 1st flags, Type flags (Present, Ring 0, Code, Exec/Read)
-    db 11001111b        ; 2nd flags, Limit (16-19)
-    db 0x0              ; Base (24-31)
-
+    dw 0xffff, 0
+    db 0, 10011010b, 11001111b, 0
 gdt_data:
-    ; Data Segment Descriptor
-    dw 0xffff           ; Limit (0-15)
-    dw 0x0              ; Base (0-15)
-    db 0x0              ; Base (16-23)
-    db 10010010b        ; 1st flags, Type flags (Present, Ring 0, Data, Read/Write)
-    db 11001111b        ; 2nd flags, Limit (16-19)
-    db 0x0              ; Base (24-31)
-
+    dw 0xffff, 0
+    db 0, 10010010b, 11001111b, 0
 gdt_end:
 
 gdt_descriptor:
-    dw gdt_end - gdt_start - 1 ; Size of GDT
-    dd gdt_start               ; Start address of GDT
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
 
 CODE_SEG equ gdt_code - gdt_start
 DATA_SEG equ gdt_data - gdt_start
 
 [bits 16]
 switch_to_pm:
-    cli                 ; Clear Interrupts (Disable BIOS interrupts)
-    lgdt [gdt_descriptor] ; Load Global Descriptor Table pointer
-    
+    cli
+    lgdt [gdt_descriptor]
     mov eax, cr0
-    or eax, 0x1         ; Set protected mode bit in Control Register 0
+    or eax, 1
     mov cr0, eax
-
-    jmp CODE_SEG:init_pm ; Perform a Far Jump to flush CPU pipeline with 32-bit instructions
+    jmp CODE_SEG:init_pm
 
 [bits 32]
 init_pm:
-    ; Update segment registers to point to 32-bit Data segment descriptor
     mov ax, DATA_SEG
     mov ds, ax
     mov ss, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
-
-    mov ebp, 0x90000    ; Relocate Stack Pointer to top of free space
+    mov ebp, 0x90000
     mov esp, ebp
-
-    call BEGIN_PM       ; Transfer execution to our 32-bit environment
-
-BEGIN_PM:
-    ; Jump to the loaded kernel's entry point address in RAM (0x10000)
     jmp CODE_SEG:0x10000
 
-; Fill remaining space with zeros to ensure this file is exactly 512 bytes
 times 510-($-$$) db 0
-dw 0xaa55               ; Standard BIOS bootloader signature
+dw 0xaa55
